@@ -799,3 +799,67 @@ describe("EditAutoRouterModal plan-mode minimum tier", () => {
     expect(savedConfig()).not.toHaveProperty("plan_mode_min_tier");
   });
 });
+
+// This form hydrates only the four built-in tier keys, and `tiers` is a MANAGED key, so before the
+// pass-through a save rebuilt {SIMPLE, MEDIUM, COMPLEX, REASONING} over a custom pool set while the
+// unmanaged tier_definitions survived: the two keys disagreed and the router failed at load.
+describe("EditAutoRouterModal stored custom tier set", () => {
+  const CUSTOM_STORED_CONFIG = {
+    tiers: { CASUAL: ["gpt-4o-mini"], SECURITY_REVIEW: ["gpt-4o-mini"] },
+    tier_definitions: [
+      { name: "CASUAL", description: "small talk" },
+      { name: "SECURITY_REVIEW", description: "security audits" },
+    ],
+    fallback_tier: "CASUAL",
+    classifier_type: "llm",
+    classifier_llm_config: { model: "gpt-4o-mini", timeout_ms: 3000 },
+  };
+
+  const CUSTOM_MODEL_DATA = {
+    model_name: "custom-tier-router",
+    litellm_params: {
+      model: "auto_router/complexity_router",
+      complexity_router_config: CUSTOM_STORED_CONFIG,
+    },
+    model_info: { id: "auto-2", access_groups: [] },
+  };
+
+  const renderCustomModal = () =>
+    renderWithProviders(
+      <EditAutoRouterModal
+        isVisible
+        onCancel={vi.fn()}
+        onSuccess={vi.fn()}
+        modelData={CUSTOM_MODEL_DATA}
+        accessToken="token"
+        userRole="Admin"
+      />,
+    );
+
+  beforeEach(() => {
+    modelPatchUpdateCall.mockClear();
+  });
+
+  it("explains the tier editor is unavailable instead of rendering a form that cannot represent the set", async () => {
+    renderCustomModal();
+
+    expect(await screen.findByText(/custom tier set, which this form cannot edit yet/i)).toBeInTheDocument();
+    expect(screen.queryByText("Complexity Tier Configuration")).not.toBeInTheDocument();
+  });
+
+  it("saves a rename with the stored complexity config byte-identical", async () => {
+    const user = userEvent.setup();
+    renderCustomModal();
+
+    await screen.findByText(/custom tier set, which this form cannot edit yet/i);
+    fireEvent.change(screen.getByRole("textbox", { name: /auto router name/i }), {
+      target: { value: "renamed-router" },
+    });
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+
+    await waitFor(() => expect(modelPatchUpdateCall).toHaveBeenCalled());
+    const [, payload] = modelPatchUpdateCall.mock.calls.at(-1) ?? [];
+    expect(payload?.model_name).toBe("renamed-router");
+    expect(savedConfig()).toEqual(CUSTOM_STORED_CONFIG);
+  });
+});

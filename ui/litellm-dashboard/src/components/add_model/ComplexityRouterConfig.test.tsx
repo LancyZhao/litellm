@@ -28,6 +28,8 @@ const baseProps = {
   modelInfo: mockModelInfo,
   value: defaultValue,
   onChange: vi.fn(),
+  editingTiers: false,
+  onEditingTiersChange: vi.fn(),
   keywordTierRules: [],
   onKeywordTierRulesChange: vi.fn(),
   semanticMatchingEnabled: false,
@@ -941,5 +943,220 @@ describe("ComplexityRouterConfig reasoning effort gating", () => {
     expect(
       screen.getByRole("combobox", { name: "Reasoning effort for gpt-3.5-turbo in the Simple tier" }),
     ).toHaveTextContent("low");
+  });
+});
+
+describe("edit tiers", () => {
+  const customValue: ComplexityRouterConfigValue = {
+    ...defaultValue,
+    classifier_type: "llm",
+    classifier_llm_config: { model: "gpt-3.5-turbo", timeout_ms: 3000 },
+    custom_tier_set: {
+      tiers: [
+        { id: "SIMPLE", name: "SIMPLE", definition: "", models: ["gpt-3.5-turbo"] },
+        { id: "COMPLEX", name: "COMPLEX", definition: "", models: ["gpt-4"] },
+        { id: "sec", name: "AUDIT", definition: "security audits", models: ["claude-3-opus"] },
+      ],
+      fallback_tier_id: "COMPLEX",
+    },
+  };
+
+  it("keyword rules pick from the custom tier names and default to the first when COMPLEX is gone", async () => {
+    const onKeywordTierRulesChange = vi.fn();
+    const noComplex: ComplexityRouterConfigValue = {
+      ...customValue,
+      custom_tier_set: {
+        tiers: [
+          { id: "cas", name: "CASUAL", definition: "small talk", models: ["gpt-3.5-turbo"] },
+          { id: "sec", name: "AUDIT", definition: "security audits", models: ["claude-3-opus"] },
+        ],
+        fallback_tier_id: "cas",
+      },
+    };
+    renderWithProviders(
+      <ComplexityRouterConfig
+        {...baseProps}
+        value={noComplex}
+        keywordTierRules={[{ id: "rule-1", keywords: ["scan"], tier: "AUDIT" }]}
+        onKeywordTierRulesChange={onKeywordTierRulesChange}
+      />,
+    );
+    fireEvent.click(screen.getByText("Advanced: Keyword/Semantic Matching"));
+    expect(screen.getByRole("combobox", { name: "Route keyword rule 1 to tier" })).toHaveTextContent("AUDIT");
+    await userEvent.click(screen.getByRole("button", { name: /add keyword rule/i }));
+    const newRules = onKeywordTierRulesChange.mock.calls[0][0] as { tier: string }[];
+    expect(newRules[1]).toMatchObject({ keywords: [], tier: "CASUAL" });
+  });
+
+  it("removing a built-in tier materializes the ordered row set and touches nothing else", async () => {
+    const onChange = vi.fn();
+    renderWithProviders(<ComplexityRouterConfig {...baseProps} editingTiers onChange={onChange} />);
+    await userEvent.click(screen.getByRole("button", { name: "Remove the MEDIUM tier" }));
+    expect(onChange).toHaveBeenCalledWith({
+      ...defaultValue,
+      custom_tier_set: {
+        tiers: [
+          { id: "SIMPLE", name: "SIMPLE", definition: "", models: defaultValue.tiers.SIMPLE },
+          { id: "COMPLEX", name: "COMPLEX", definition: "", models: defaultValue.tiers.COMPLEX },
+          { id: "REASONING", name: "REASONING", definition: "", models: defaultValue.tiers.REASONING },
+        ],
+        fallback_tier_id: "SIMPLE",
+      },
+    });
+  });
+
+  it("Restore defaults refills missing built-ins but only Use built-in tiers exits, returning the pristine value", async () => {
+    const onChange = vi.fn();
+    const removed: ComplexityRouterConfigValue = {
+      ...defaultValue,
+      custom_tier_set: {
+        tiers: (["SIMPLE", "COMPLEX", "REASONING"] as const).map((tier) => ({
+          id: tier,
+          name: tier,
+          definition: "",
+          models: defaultValue.tiers[tier],
+        })),
+        fallback_tier_id: "SIMPLE",
+      },
+    };
+    renderWithProviders(<ComplexityRouterConfig {...baseProps} editingTiers value={removed} onChange={onChange} />);
+    await userEvent.click(screen.getByRole("button", { name: "Restore defaults" }));
+    const restored = onChange.mock.calls.at(-1)?.[0] as ComplexityRouterConfigValue;
+    expect(restored.custom_tier_set?.tiers.map((row) => row.id)).toEqual(["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"]);
+
+    await userEvent.click(screen.getByRole("button", { name: "Use built-in tiers" }));
+    expect(onChange).toHaveBeenLastCalledWith(defaultValue);
+  });
+
+  it("removing a row snapshots its in-editor models so Restore returns them, not a stale pool", async () => {
+    const onChange = vi.fn();
+    const edited: ComplexityRouterConfigValue = {
+      ...customValue,
+      custom_tier_set: {
+        ...customValue.custom_tier_set!,
+        tiers: customValue.custom_tier_set!.tiers.map((row) =>
+          row.id === "SIMPLE" ? { ...row, models: ["edited-in-editor"] } : row,
+        ),
+      },
+    };
+    renderWithProviders(<ComplexityRouterConfig {...baseProps} editingTiers value={edited} onChange={onChange} />);
+    await userEvent.click(screen.getByRole("button", { name: "Remove the SIMPLE tier" }));
+    const next = onChange.mock.calls[0][0] as ComplexityRouterConfigValue;
+    expect(next.tiers.SIMPLE).toEqual(["edited-in-editor"]);
+    expect(next.custom_tier_set?.tiers.some((row) => row.id === "SIMPLE")).toBe(false);
+  });
+
+  it("shows name and definition inputs for the rows and disables session pinning with a hint", async () => {
+    renderWithProviders(<ComplexityRouterConfig {...baseProps} editingTiers value={customValue} />);
+    expect(screen.getByLabelText("Name for tier 3")).toHaveValue("AUDIT");
+    expect(screen.getByLabelText("Definition for tier 3")).toHaveValue("security audits");
+    expect(screen.queryByLabelText("Display name for the Simple tier")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByText("Advanced: Affinity"));
+    expect(screen.getByLabelText("Pin a session to its first model")).toHaveAttribute("data-disabled");
+    expect(screen.getByText(/Unavailable with an edited tier set: escalating a pinned session/)).toBeInTheDocument();
+  });
+
+  it("shows no per-model effort controls on custom rows", () => {
+    renderWithProviders(
+      <ComplexityRouterConfig
+        {...baseProps}
+        editingTiers
+        value={{ ...customValue, tier_model_params: { AUDIT: { "claude-3-opus": { reasoning_effort: "high" } } } }}
+      />,
+    );
+    expect(screen.queryByRole("combobox", { name: /Reasoning effort/ })).not.toBeInTheDocument();
+  });
+
+  it("view mode shows only the tier name and models; the definition moves into the info tooltip", () => {
+    renderWithProviders(<ComplexityRouterConfig {...baseProps} value={customValue} />);
+    expect(screen.getByText("AUDIT Tier")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Name for tier 3")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Definition for tier 3")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Remove the/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit tiers" })).toBeInTheDocument();
+  });
+
+  it("Done stays disabled until every row has a name, a definition, and models", () => {
+    const incomplete: ComplexityRouterConfigValue = {
+      ...customValue,
+      custom_tier_set: {
+        ...customValue.custom_tier_set!,
+        tiers: [...customValue.custom_tier_set!.tiers, { id: "new-1", name: "", definition: "", models: [] }],
+      },
+    };
+    const { rerender } = renderWithProviders(<ComplexityRouterConfig {...baseProps} editingTiers value={incomplete} />);
+    expect(screen.getByRole("button", { name: "Done" })).toHaveAttribute("data-disabled");
+
+    rerender(<ComplexityRouterConfig {...baseProps} editingTiers value={customValue} />);
+    expect(screen.getByRole("button", { name: "Done" })).not.toHaveAttribute("data-disabled");
+  });
+
+  // Every key the backend rejects beside tier_definitions is stripped from the payload, so its control
+  // has to say it is unavailable rather than sit there looking editable and doing nothing.
+  it("disables the classifier inputs an edited tier set rejects, and drops the built-in score brackets", () => {
+    renderWithProviders(<ComplexityRouterConfig {...baseProps} value={customValue} />);
+    fireEvent.click(screen.getByText("Advanced: Classification Method"));
+
+    expect(screen.getByRole("combobox", { name: "Classification Rubric" })).toBeDisabled();
+    expect(screen.getByText(/Unavailable with an edited tier set: a replacement prompt/)).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /Score with the heuristic/ })).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByText(/Your Fallback Tier decides this/)).toBeInTheDocument();
+    expect(screen.getByText(/There are no score brackets/)).toBeInTheDocument();
+    expect(screen.queryByText(/7 dimensions/)).not.toBeInTheDocument();
+  });
+
+  // The fallback and plan-mode pointers survive a rename because they hold a row id. Keyword rules
+  // hold the tier NAME, so without this they keep pointing at the old string and the backend
+  // rejects the save with "keyword_tier_rules reference unknown tiers".
+  it("carries keyword rules along when their tier is renamed", () => {
+    const onKeywordTierRulesChange = vi.fn();
+    renderWithProviders(
+      <ComplexityRouterConfig
+        {...baseProps}
+        editingTiers
+        value={customValue}
+        keywordTierRules={[
+          { id: "rule-1", keywords: ["scan"], tier: "AUDIT" },
+          { id: "rule-2", keywords: ["chat"], tier: "SIMPLE" },
+        ]}
+        onKeywordTierRulesChange={onKeywordTierRulesChange}
+      />,
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "Name for tier 3" }), {
+      target: { value: "SECURITY_REVIEW" },
+    });
+    expect(onKeywordTierRulesChange).toHaveBeenCalledWith([
+      { id: "rule-1", keywords: ["scan"], tier: "SECURITY_REVIEW" },
+      { id: "rule-2", keywords: ["chat"], tier: "SIMPLE" },
+    ]);
+  });
+
+  it("normalizes pasted newlines out of a definition and caps both fields at the backend limits", () => {
+    const onChange = vi.fn();
+    renderWithProviders(<ComplexityRouterConfig {...baseProps} editingTiers value={customValue} onChange={onChange} />);
+    const definition = screen.getByRole("textbox", { name: "Definition for tier 3" });
+    expect(definition).toHaveAttribute("maxLength", "500");
+    expect(screen.getByRole("textbox", { name: "Name for tier 3" })).toHaveAttribute("maxLength", "64");
+    fireEvent.change(definition, { target: { value: "audits\nand\r\nreviews" } });
+    const updated = onChange.mock.calls.at(-1)?.[0] as ComplexityRouterConfigValue;
+    expect(updated.custom_tier_set?.tiers[2].definition).toBe("audits and reviews");
+  });
+
+  it("disables the plan-mode override with a hint while a tier set is edited, keeping the saved floor visible", () => {
+    renderWithProviders(
+      <ComplexityRouterConfig {...baseProps} value={{ ...customValue, plan_mode_min_tier: "COMPLEX" }} />,
+    );
+    fireEvent.click(screen.getByText("Advanced: Plan-Mode Override"));
+    const floorSwitch = screen.getByRole("switch", { name: "Route plan-mode requests to a minimum tier" });
+    expect(floorSwitch).toHaveAttribute("aria-disabled", "true");
+    expect(floorSwitch).toBeChecked();
+    expect(screen.getByText(/Locked while a tier set is edited/)).toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Plan-mode minimum tier" })).not.toBeInTheDocument();
+  });
+
+  it("shows the editor controls from the parent-owned editing flag, surviving a section remount", () => {
+    renderWithProviders(<ComplexityRouterConfig {...baseProps} editingTiers />);
+    expect(screen.getByRole("button", { name: "Add tier" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Done" })).toBeInTheDocument();
   });
 });

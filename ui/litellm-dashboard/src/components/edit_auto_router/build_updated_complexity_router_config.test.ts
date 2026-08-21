@@ -27,6 +27,34 @@ const hydratedState: KeywordMatchingState = {
   matchThreshold: 0.72,
 };
 
+describe("buildUpdatedComplexityRouterConfig stored custom tier set", () => {
+  const storedCustom = {
+    tiers: { CASUAL: ["gpt-4o-mini"], SECURITY_REVIEW: ["claude-opus-4"] },
+    tier_definitions: [
+      { name: "CASUAL", description: "small talk" },
+      { name: "SECURITY_REVIEW", description: "security audits" },
+    ],
+    fallback_tier: "CASUAL",
+    classifier_type: "llm",
+    classifier_llm_config: { model: "gpt-4o-mini" },
+  };
+
+  it("passes the stored config through verbatim: this form cannot represent tier_definitions", () => {
+    const result = buildUpdatedComplexityRouterConfig(storedCustom, FORM_VALUE, undefined, hydratedState);
+    expect(result).toEqual(storedCustom);
+  });
+
+  it("parses a stored JSON string before deciding to pass it through", () => {
+    const result = buildUpdatedComplexityRouterConfig(
+      JSON.stringify(storedCustom),
+      FORM_VALUE,
+      undefined,
+      hydratedState,
+    );
+    expect(result).toEqual(storedCustom);
+  });
+});
+
 describe("buildUpdatedComplexityRouterConfig keyword matching", () => {
   it("round-trips an untouched edit without changing any keyword-matching value", () => {
     // Opening the modal hydrates state from STORED; saving with nothing changed must be a

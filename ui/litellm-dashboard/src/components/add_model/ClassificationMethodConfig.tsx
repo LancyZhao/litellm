@@ -26,6 +26,7 @@ import {
   CLASSIFICATION_RUBRIC_KEYS,
   ClassificationRubric,
   effectiveTierLabel,
+  effectiveClassifierType,
 } from "./ComplexityRouterConfig";
 
 const DEFAULT_SCORING_EXPLANATION =
@@ -80,6 +81,26 @@ const boundaryRanges = (
     reasoningOverrideFloor: (reasoningOverrideMinScore ?? low).toFixed(2),
   };
 };
+
+const rubricPresetDisabledReason = (hasCustomTierSet: boolean, usesCustomPrompt: boolean): string | undefined => {
+  if (hasCustomTierSet)
+    return "Unavailable with an edited tier set: the preset calibration examples are written against the built-in tiers your set replaces";
+  if (usesCustomPrompt) return "Your custom prompt replaces the built-in rubric entirely";
+  return undefined;
+};
+
+const CustomTierClassificationCard: React.FC = () => (
+  <Card className="bg-muted mt-4">
+    <CardContent>
+      <strong className="block mb-2 font-semibold">How Classification Works</strong>
+      <span className="text-[13px] text-muted-foreground">
+        The LLM classifier reads your tier definitions and returns one of your tier names. There are no score brackets:
+        the heuristic scorer only produces the built-in tiers, so it cannot run here. A classification that fails or
+        names an unknown tier routes to your Fallback Tier.
+      </span>
+    </CardContent>
+  </Card>
+);
 
 const HowClassificationWorks: React.FC<{ value: ComplexityRouterConfigValue }> = ({ value }) => {
   // The shipped boundaries come from the proxy, so this card cannot state ranges the router stopped using.
@@ -146,9 +167,12 @@ const ClassificationMethodConfig: React.FC<ClassificationMethodConfigProps> = ({
   defaultModel,
 }) => {
   const hasDefaultModel = Boolean(defaultModel);
+  const hasCustomTierSet = Boolean(value.custom_tier_set);
+  const classifierType = effectiveClassifierType(value);
   const classifierModelMissing =
-    showValidationErrors && value.classifier_type === "llm" && !value.classifier_llm_config?.model;
+    showValidationErrors && classifierType === "llm" && !value.classifier_llm_config?.model;
   const usesCustomPrompt = Boolean(value.classifier_llm_config?.system_prompt?.trim());
+  const rubricDisabledReason = rubricPresetDisabledReason(hasCustomTierSet, usesCustomPrompt);
   const classificationRubric = value.classifier_llm_config?.classification_rubric ?? DEFAULT_CLASSIFICATION_RUBRIC;
 
   const handleClassifierTypeChange = (classifierType: ClassifierType) => {
@@ -252,20 +276,28 @@ const ClassificationMethodConfig: React.FC<ClassificationMethodConfigProps> = ({
   return (
     <>
       <RadioGroup
-        value={value.classifier_type}
+        value={classifierType}
         onValueChange={(classifierType: unknown) => handleClassifierTypeChange(classifierType as ClassifierType)}
         className="w-full"
       >
         <div className="flex w-full flex-col items-start gap-2">
-          <Label className="items-start font-normal leading-normal">
-            <RadioGroupItem value="heuristic" className="mt-0.5" />
-            <span>
-              <strong className="font-semibold">Heuristic</strong>{" "}
-              <span className="text-muted-foreground">
-                (default) — rule-based scoring, no API calls, &lt;1ms latency
+          <SimpleTooltip
+            content={
+              hasCustomTierSet
+                ? "An edited tier set requires the LLM classifier: the heuristic scorer only produces the built-in tiers"
+                : undefined
+            }
+          >
+            <Label className="items-start font-normal leading-normal has-data-disabled:cursor-not-allowed has-data-disabled:opacity-50">
+              <RadioGroupItem value="heuristic" className="mt-0.5" disabled={hasCustomTierSet} />
+              <span>
+                <strong className="font-semibold">Heuristic</strong>{" "}
+                <span className="text-muted-foreground">
+                  (default) — rule-based scoring, no API calls, &lt;1ms latency
+                </span>
               </span>
-            </span>
-          </Label>
+            </Label>
+          </SimpleTooltip>
           <Label className="items-start font-normal leading-normal">
             <RadioGroupItem value="llm" className="mt-0.5" />
             <span>
@@ -276,7 +308,7 @@ const ClassificationMethodConfig: React.FC<ClassificationMethodConfigProps> = ({
         </div>
       </RadioGroup>
 
-      {value.classifier_type === "llm" && (
+      {classifierType === "llm" && (
         <div className="mt-4 space-y-3">
           <div>
             <strong className="block mb-1 font-semibold">Classifier Model</strong>
@@ -313,10 +345,7 @@ const ClassificationMethodConfig: React.FC<ClassificationMethodConfigProps> = ({
                 <Info className="size-4 text-muted-foreground" />
               </SimpleTooltip>
             </div>
-            <SimpleTooltip
-              content={usesCustomPrompt ? "Your custom prompt replaces the built-in rubric entirely" : undefined}
-              className="w-full"
-            >
+            <SimpleTooltip content={rubricDisabledReason} className="w-full">
               <Select
                 items={CLASSIFICATION_RUBRIC_KEYS.map((preset) => ({
                   value: preset,
@@ -326,7 +355,7 @@ const ClassificationMethodConfig: React.FC<ClassificationMethodConfigProps> = ({
                 onValueChange={(preset: ClassificationRubric | null) =>
                   preset && handleClassificationRubricChange(preset)
                 }
-                disabled={usesCustomPrompt}
+                disabled={usesCustomPrompt || hasCustomTierSet}
               >
                 <SelectTrigger aria-label="Classification Rubric" className="w-full">
                   <SelectValue />
@@ -348,19 +377,32 @@ const ClassificationMethodConfig: React.FC<ClassificationMethodConfigProps> = ({
           </div>
           <div>
             <strong className="block mb-1 font-semibold">Classifier Prompt</strong>
-            <ClassifierPromptEditor
-              systemPrompt={value.classifier_llm_config?.system_prompt}
-              onChange={handleClassifierSystemPromptChange}
-              contextWindowSize={value.classifier_context_window_size ?? DEFAULT_CLASSIFIER_CONTEXT_WINDOW_SIZE}
-              tierLabels={value.tier_labels}
-              classificationRubric={classificationRubric}
-            />
+            {hasCustomTierSet ? (
+              <span className="block text-xs text-muted-foreground">
+                Unavailable with an edited tier set: a replacement prompt would drop the tier definitions the classifier
+                routes on, along with the injection guard. Your tier definitions are the rubric.
+              </span>
+            ) : (
+              <ClassifierPromptEditor
+                systemPrompt={value.classifier_llm_config?.system_prompt}
+                onChange={handleClassifierSystemPromptChange}
+                contextWindowSize={value.classifier_context_window_size ?? DEFAULT_CLASSIFIER_CONTEXT_WINDOW_SIZE}
+                tierLabels={value.tier_labels}
+                classificationRubric={classificationRubric}
+              />
+            )}
           </div>
           <div>
             <strong className="block mb-1 font-semibold">If the classifier fails</strong>
+            {hasCustomTierSet && (
+              <span className="block mb-2 text-xs text-muted-foreground">
+                Your Fallback Tier decides this for an edited tier set, so these options are unavailable.
+              </span>
+            )}
             <RadioGroup
               value={value.classifier_fallback ?? DEFAULT_CLASSIFIER_FALLBACK}
               onValueChange={(fallback: unknown) => handleClassifierFallbackChange(fallback as ClassifierFallback)}
+              disabled={hasCustomTierSet}
             >
               <div className="inline-flex flex-col gap-2">
                 <Label className="items-start font-normal leading-normal">
@@ -478,7 +520,7 @@ const ClassificationMethodConfig: React.FC<ClassificationMethodConfigProps> = ({
 
       <HeuristicScoringConfig value={value} onChange={onChange} />
 
-      <HowClassificationWorks value={value} />
+      {hasCustomTierSet ? <CustomTierClassificationCard /> : <HowClassificationWorks value={value} />}
     </>
   );
 };

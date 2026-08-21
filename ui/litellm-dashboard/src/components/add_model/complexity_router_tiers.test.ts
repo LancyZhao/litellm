@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  customTierDefaultModel,
   hydrateTierModelParams,
   normalizeTierModels,
   pruneTierModelParams,
@@ -232,5 +233,27 @@ describe("pruneTierModelParams", () => {
   it("returns the input unchanged when the tier holds no params", () => {
     const current = { COMPLEX: { opus: { reasoning_effort: "high" } } };
     expect(pruneTierModelParams(current, "MEDIUM", [])).toBe(current);
+  });
+});
+
+describe("customTierDefaultModel", () => {
+  const set = (names: string[], fallbackId: string) => ({
+    tiers: names.map((name, index) => ({ id: `r${index}`, name, definition: "d", models: [`${name}-model`] })),
+    fallback_tier_id: fallbackId,
+  });
+
+  it("prefers an explicit pin over every derivation", () => {
+    expect(customTierDefaultModel(set(["CASUAL"], "r0"), "pinned-model")).toBe("pinned-model");
+  });
+
+  it("falls back to the fallback tier's first model", () => {
+    expect(customTierDefaultModel(set(["CASUAL", "AUDIT"], "r1"))).toBe("AUDIT-model");
+  });
+
+  // The backend resolves tier names with casefold, so a set that spells its tier "medium" must
+  // derive the same default the router will pick, not skip to SIMPLE or come back undefined.
+  it("resolves the MEDIUM and SIMPLE derivation case-insensitively", () => {
+    expect(customTierDefaultModel(set(["medium", "simple"], "gone"))).toBe("medium-model");
+    expect(customTierDefaultModel(set(["simple"], "gone"))).toBe("simple-model");
   });
 });
