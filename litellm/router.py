@@ -9468,6 +9468,7 @@ class Router:
                         "model_group": user_facing_model_group_name,
                         "providers": [llm_provider],
                         **model_info,
+                        "supported_reasoning_efforts": None,
                     }
                 )
             else:
