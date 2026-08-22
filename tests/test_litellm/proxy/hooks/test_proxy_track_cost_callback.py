@@ -820,6 +820,45 @@ async def test_track_cost_callback_keeps_reservation_open_for_in_progress_backgr
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", ["failed", "cancelled", "completed", "incomplete"])
+async def test_track_cost_callback_releases_reservation_for_terminal_interaction_without_usage(
+    terminal_status,
+):
+    """
+    A background create that reaches a terminal status without a usage block
+    (e.g. failed or cancelled) has nothing to bill and no poll task will ever
+    settle it, so the callback must release the reservation immediately
+    instead of leaving spend counters pinned until the reservation's TTL.
+    """
+    from litellm.types.interactions import InteractionsAPIResponse
+
+    logger = _ProxyDBLogger()
+    reservation = {"reserved_cost": 0.05, "entries": [], "finalized": False}
+    terminal_response = InteractionsAPIResponse(
+        id="interactions/bg-abc",
+        model="gemini-3-flash-preview",
+        status=terminal_status,
+    )
+
+    with patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj",
+    ) as mock_proxy_logging:
+        mock_proxy_logging.failed_tracking_alert = AsyncMock()
+        mock_proxy_logging.db_spend_update_writer = MagicMock()
+        mock_proxy_logging.db_spend_update_writer.update_database = AsyncMock()
+
+        await logger._PROXY_track_cost_callback(
+            kwargs=_in_progress_interaction_kwargs(reservation),
+            completion_response=terminal_response,
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+        )
+
+        assert reservation["finalized"] is True
+        mock_proxy_logging.failed_tracking_alert.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_track_cost_callback_releases_reservation_for_in_progress_interaction_when_polling_disabled(
     monkeypatch,
 ):

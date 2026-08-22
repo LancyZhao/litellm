@@ -224,14 +224,12 @@ async def maybe_settle_background_interaction_before_delete(
     context = entry.context
     try:
         response = await fetch_interaction(context)
-    except Exception as e:  # noqa: BLE001  # unfetchable pre-delete state settles by releasing the reservation
+    except Exception as e:  # noqa: BLE001  # a transient fetch failure must leave the poll task free to settle later
         verbose_logger.debug(
-            "Could not fetch background interaction %s before delete, releasing its reservation: %s",
+            "Could not fetch background interaction %s before delete, deferring settlement to the poll task: %s",
             interaction_id,
             e,
         )
-        if _claim_settlement(context.logging_obj):
-            await _release_open_budget_reservation(logging_obj=context.logging_obj)
         return
     if not _claim_settlement(context.logging_obj):
         return

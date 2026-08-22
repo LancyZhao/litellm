@@ -480,7 +480,11 @@ def _write_spend_metadata_to_kwargs(kwargs: dict, metadata: dict) -> None:
 def _is_unbilled_in_progress_interaction(completion_response: object) -> bool:
     from litellm.types.interactions import InteractionsAPIResponse
 
-    return isinstance(completion_response, InteractionsAPIResponse) and completion_response.usage is None
+    return (
+        isinstance(completion_response, InteractionsAPIResponse)
+        and completion_response.status == "in_progress"
+        and completion_response.usage is None
+    )
 
 
 def _should_track_cost_callback(

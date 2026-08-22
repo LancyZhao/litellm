@@ -270,20 +270,23 @@ async def test_delete_settlement_releases_reservation_when_still_in_progress():
 
 
 @pytest.mark.asyncio
-async def test_delete_settlement_releases_reservation_when_prefetch_fails():
+async def test_delete_settlement_defers_to_poll_task_when_prefetch_fails():
     reservation = _reservation()
     logging_obj = _logging_obj_with_reservation(reservation)
-    task = _register_poll(logging_obj)
-    fetch, _ = _fetch_sequence(RuntimeError("interaction already deleted"))
+    poll_fetch, poll_calls = _fetch_sequence(_response("completed", with_usage=True))
+    task = _register_poll(logging_obj, poll_fetch=poll_fetch)
+    fetch, _ = _fetch_sequence(RuntimeError("transient network error"))
 
     await maybe_settle_background_interaction_before_delete(
         interaction_id="interactions/bg-abc",
         fetch_interaction=fetch,
     )
 
-    assert reservation["finalized"] is True
-    assert logging_obj.model_call_details.get("response_cost") is None
+    assert logging_obj.model_call_details.get(_SETTLED_KEY) is not True
+    assert reservation["finalized"] is False
     await asyncio.wait_for(task, timeout=5)
+    assert len(poll_calls) >= 1
+    assert logging_obj.model_call_details["response_cost"] > 0
 
 
 @pytest.mark.asyncio
