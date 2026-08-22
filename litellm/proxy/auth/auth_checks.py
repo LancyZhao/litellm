@@ -86,6 +86,8 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     object_permission_cache_key,
     tag_cache_key,
     tag_registry_cache_key,
+    team_membership_auth_cache_key,
+    team_membership_reservation_cache_key,
 )
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
 from litellm.proxy.guardrails.tool_name_extraction import (
@@ -1966,7 +1968,7 @@ async def get_team_membership(
     if user_id is None or team_id is None:
         return None
 
-    _key: Final = f"team_membership:{user_id}:{team_id}"
+    _key: Final = team_membership_reservation_cache_key(user_id=user_id, team_id=team_id)
 
     # check if in cache
     cached_membership_obj: Final = await user_api_key_cache.async_get_cache(
@@ -2399,6 +2401,32 @@ async def _cache_team_object(
                 alias_key,
                 e,
             )
+
+
+async def invalidate_team_member_spend_state(
+    user_id: str,
+    team_id: str,
+    user_api_key_cache: UserApiKeyCache,
+) -> None:
+    """
+    Clear every cached read path for one team member's budget so a spend
+    reset or a raised cap takes effect on the next request instead of
+    waiting on the membership cache's TTL.
+
+    Two independently-keyed cache entries hold the same LiteLLM_TeamMembership
+    row: user_api_key_auth.py's admission check writes ``{team_id}_{user_id}``,
+    while budget_reservation.py's pre-call reservation and auth_checks.py's own
+    get_team_membership() (used by _check_team_member_budget) both write
+    ``team_membership:{user_id}:{team_id}``. Both formats must be invalidated
+    explicitly; writing one does not refresh the other.
+    """
+    from litellm.proxy.proxy_server import _invalidate_spend_counter
+
+    await _invalidate_spend_counter(counter_key=f"spend:team_member:{user_id}:{team_id}")
+    await user_api_key_cache.async_delete_cache(key=team_membership_auth_cache_key(team_id=team_id, user_id=user_id))
+    await user_api_key_cache.async_delete_cache(
+        key=team_membership_reservation_cache_key(user_id=user_id, team_id=team_id)
+    )
 
 
 async def delete_cache_team_object(

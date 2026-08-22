@@ -16,7 +16,7 @@ import traceback
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from types import MappingProxyType
-from typing import Annotated, Final, NamedTuple, Protocol, TypedDict, TypeVar, cast
+from typing import Annotated, Final, NamedTuple, NoReturn, Protocol, TypedDict, TypeVar, cast
 
 import fastapi
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
@@ -56,6 +56,7 @@ from litellm.proxy._types import (
     PatchTeamRequest,
     ProxyErrorTypes,
     ProxyException,
+    ResetSpendRequest,
     SpecialManagementEndpointEnums,
     SpecialModelNames,
     SpecialProxyStrings,
@@ -84,6 +85,7 @@ from litellm.proxy.auth.auth_checks import (
     get_team_membership,
     get_team_object,
     get_user_object,
+    invalidate_team_member_spend_state,
 )
 from litellm.proxy.auth.auth_utils import (
     enforce_batch_enqueued_token_limit_is_admin_only,
@@ -3391,7 +3393,7 @@ async def team_member_update(
 
     Update team member budgets and team member role
     """
-    from litellm.proxy.proxy_server import premium_user, prisma_client
+    from litellm.proxy.proxy_server import premium_user, prisma_client, user_api_key_cache
 
     if prisma_client is None:
         raise HTTPException(status_code=500, detail={"error": "No db connected"})
@@ -3490,6 +3492,12 @@ async def team_member_update(
             budget_patch=budget_patch,
             team_default_budget_id=team_default_budget_id,
         )
+    if budget_patch:
+        await invalidate_team_member_spend_state(
+            user_id=received_user_id,
+            team_id=data.team_id,
+            user_api_key_cache=user_api_key_cache,
+        )
 
     ### update team member role
     if data.role is not None:
@@ -3524,6 +3532,114 @@ async def team_member_update(
         budget_duration=data.budget_duration,
         allowed_models=data.allowed_models,
     )
+
+
+def _raise_reset_spend_error(status_code: int, message: str) -> NoReturn:
+    detail: Final = {"error": message}  # mutable-ok: HTTPException.detail takes a dict
+    raise HTTPException(status_code=status_code, detail=detail)
+
+
+def _validate_team_member_reset_spend_value(
+    reset_to: object,
+    membership: LiteLLM_TeamMembership,
+) -> float:
+    if not isinstance(reset_to, (int, float)):
+        _raise_reset_spend_error(status.HTTP_400_BAD_REQUEST, "reset_to must be a float")
+
+    reset_to_float: Final = float(reset_to)
+    if reset_to_float < 0:
+        _raise_reset_spend_error(status.HTTP_400_BAD_REQUEST, "reset_to must be >= 0")
+
+    current_spend: Final = membership.spend or 0.0
+    if reset_to_float > current_spend:
+        _raise_reset_spend_error(
+            status.HTTP_400_BAD_REQUEST,
+            f"reset_to ({reset_to_float}) must be <= current spend ({current_spend})",
+        )
+
+    max_budget: Final = membership.litellm_budget_table.max_budget if membership.litellm_budget_table else None
+    if max_budget is not None and reset_to_float > max_budget:
+        _raise_reset_spend_error(
+            status.HTTP_400_BAD_REQUEST,
+            f"reset_to ({reset_to_float}) must be <= budget ({max_budget})",
+        )
+
+    return reset_to_float
+
+
+@router.post(
+    "/team/{team_id}/member/{user_id}/reset_spend",
+    tags=["team management"],  # mutable-ok: FastAPI's `tags` param is typed as list[str], not Sequence
+    dependencies=(Depends(user_api_key_auth),),
+)
+@management_endpoint_wrapper
+async def reset_team_member_spend_fn(
+    team_id: str,
+    user_id: str,
+    data: ResetSpendRequest,
+    user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
+):
+    """
+    Reset a team member's tracked spend against their per-member budget.
+
+    A member's spend is tracked separately from both their own personal
+    budget and the team's own budget (LiteLLM_TeamMembership.spend), so
+    neither /user/update nor /team/update can clear it: this is the only
+    endpoint that does. The cross-pod spend counter and cached membership
+    reads are invalidated so the reset takes effect on the member's next
+    request rather than waiting on the membership cache's TTL.
+    """
+    from litellm.proxy.proxy_server import prisma_client, proxy_logging_obj, user_api_key_cache
+
+    if prisma_client is None:
+        _raise_reset_spend_error(status.HTTP_500_INTERNAL_SERVER_ERROR, "DB not connected. prisma_client is None")
+
+    team_obj: Final = await get_team_object(
+        team_id=team_id,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        parent_otel_span=None,
+        proxy_logging_obj=proxy_logging_obj,
+        check_db_only=True,
+    )
+    if team_obj is None:
+        _raise_reset_spend_error(status.HTTP_404_NOT_FOUND, f"Team {team_id} not found.")
+    await _verify_team_access(team_obj=team_obj, user_api_key_dict=user_api_key_dict)
+
+    membership_where: Final = {  # mutable-ok: prisma client requires a plain dict where= argument
+        "user_id_team_id": {"user_id": user_id, "team_id": team_id}  # mutable-ok: same prisma where= argument
+    }
+    _membership_row: Final = await _team_membership_db(prisma_client).find_unique(
+        where=membership_where,
+        include={"litellm_budget_table": True},  # mutable-ok: prisma client requires a plain dict include= argument
+    )
+    if _membership_row is None:
+        _raise_reset_spend_error(status.HTTP_404_NOT_FOUND, f"User {user_id} is not a member of team {team_id}.")
+    membership: Final = LiteLLM_TeamMembership.model_validate(_membership_row.model_dump())
+
+    current_spend: Final = membership.spend or 0.0
+    reset_to: Final = _validate_team_member_reset_spend_value(data.reset_to, membership)
+
+    updated_membership: Final = await _team_membership_db(prisma_client).update(
+        where=membership_where,
+        data={"spend": reset_to},  # mutable-ok: prisma client requires a plain dict data= argument
+    )
+    if updated_membership is None:
+        _raise_reset_spend_error(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to update team member spend")
+
+    await invalidate_team_member_spend_state(
+        user_id=user_id,
+        team_id=team_id,
+        user_api_key_cache=user_api_key_cache,
+    )
+
+    return {  # mutable-ok: matches this router's established untyped-response-dict convention
+        "team_id": team_id,
+        "user_id": user_id,
+        "spend": reset_to,
+        "previous_spend": current_spend,
+        "max_budget": membership.litellm_budget_table.max_budget if membership.litellm_budget_table else None,
+    }
 
 
 def _create_results_from_response(

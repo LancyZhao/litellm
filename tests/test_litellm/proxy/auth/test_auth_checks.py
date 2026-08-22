@@ -47,6 +47,7 @@ from litellm.proxy.auth.auth_checks import (
     _virtual_key_soft_budget_check,
     get_key_object,
     get_user_object,
+    invalidate_team_member_spend_state,
     vector_store_access_check,
 )
 from litellm.caching.in_memory_cache import InMemoryCache
@@ -6892,3 +6893,27 @@ def test_model_has_no_cost_mapping_alias_to_a_group_priced_through_model_info_is
     router = _router_with_a_group_priced_through_model_info()
 
     assert model_has_no_cost_mapping(model="model-info-priced-alias", llm_router=router) is False
+
+
+@pytest.mark.asyncio
+async def test_invalidate_team_member_spend_state_clears_the_spend_counter_and_both_membership_cache_keys():
+    """A team-member budget reset must invalidate the spend counter AND both
+    independently-keyed membership caches (user_api_key_auth.py's admission
+    check writes one key format, budget_reservation.py and auth_checks.py's
+    own get_team_membership() write the other) or a stale read keeps 429ing
+    after the reset."""
+    mock_cache = MagicMock()
+    mock_cache.async_delete_cache = AsyncMock()
+    mock_invalidate_counter = AsyncMock()
+
+    with patch("litellm.proxy.proxy_server._invalidate_spend_counter", mock_invalidate_counter):
+        await invalidate_team_member_spend_state(
+            user_id="user-1",
+            team_id="team-1",
+            user_api_key_cache=mock_cache,
+        )
+
+    mock_invalidate_counter.assert_awaited_once_with(counter_key="spend:team_member:user-1:team-1")
+    mock_cache.async_delete_cache.assert_any_call(key="team-1_user-1")
+    mock_cache.async_delete_cache.assert_any_call(key="team_membership:user-1:team-1")
+    assert mock_cache.async_delete_cache.await_count == 2
